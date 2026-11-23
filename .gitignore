@@ -1,0 +1,8 @@
+# Build outputs
+*.exe
+*.o
+*.obj
+*.res
+*.pdb
+*.sha256
+build/

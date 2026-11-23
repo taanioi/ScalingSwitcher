@@ -1,0 +1,223 @@
+name: Build Scaling Switcher
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download and verify w64devkit
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url      = "https://github.com/skeeto/w64devkit/releases/download/v2.11.0/w64devkit-x64-2.11.0.7z.exe"
+          $expected = "54c2bb9962e8a30c8270e34c5efc3d5fee579f53087fa7d435b95fbba2af7b2b"
+          $sfx      = Join-Path $env:RUNNER_TEMP "w64devkit-x64-2.11.0.7z.exe"
+          $dir      = Join-Path $env:RUNNER_TEMP "w64devkit_dist"
+
+          curl.exe -fsSL -o $sfx $url
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download w64devkit." }
+
+          $actual = (Get-FileHash -Path $sfx -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "SHA-256 mismatch for w64devkit! Expected $expected, got $actual" }
+
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          & $sfx -y "-o$dir" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Failed to extract w64devkit." }
+
+          $bin = Join-Path $dir "w64devkit\bin"
+          if (-not (Test-Path (Join-Path $bin "g++.exe"))) { throw "w64devkit bin directory not found at $bin" }
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build ScalingSwitcher.exe
+        run: .\build.ps1
+
+      - name: Run StrUtil & NVAPI struct unit tests
+        run: |
+          $ErrorActionPreference = "Stop"
+          $testCpp = Join-Path $env:RUNNER_TEMP "nvapi_unit_test.cpp"
+          $testExe = Join-Path $env:RUNNER_TEMP "nvapi_unit_test.exe"
+          $repoSrc = (Join-Path (Get-Location).Path "src").Replace('\', '/')
+
+          @'
+          #ifndef UNICODE
+          #define UNICODE
+          #endif
+          #ifndef _UNICODE
+          #define _UNICODE
+          #endif
+          #include <limits.h>
+          #include <stdio.h>
+          #include <wchar.h>
+          #include "nvapi.h"
+
+          int wmain() {
+              wchar_t buf[256] = {};
+
+              StrUtil::SafeCopy(buf, 5, L"ABCDEFGH");
+              if (wcscmp(buf, L"ABCD") != 0) return 1;
+
+              StrUtil::SafeCopy(buf, 5, nullptr);
+              if (buf[0] != L'\0') return 2;
+
+              StrUtil::SafeFormat(buf, 256, L"Current mode: %s", L"Display - No Scaling");
+              if (wcscmp(buf, L"Current mode: Display - No Scaling") != 0) return 3;
+
+              StrUtil::SafeFormat(buf, 256, L"u=%u d=%d min=%d pct=100%% nul=[%s]",
+                                  240u, -104, INT_MIN, nullptr);
+              if (wcscmp(buf, L"u=240 d=-104 min=-2147483648 pct=100% nul=[]") != 0) return 4;
+
+              wchar_t tiny[10] = {};
+              StrUtil::SafeFormat(tiny, 10, L"%s-%d", L"ABCDEFG", 12345);
+              if (wcscmp(tiny, L"ABCDEFG-1") != 0) return 5;
+
+              StrUtil::SafeFormat(buf, 256,
+                  L"Driver kept %s (could not apply %s).",
+                  NvApi::GetScalingLabel(NvScaling::DisplayAspectRatio),
+                  NvApi::GetScalingLabel(NvScaling::GpuIntegerScaling));
+              if (wcslen(buf) >= 85) return 6;
+
+              if (StrUtil::Len(nullptr) != 0 || StrUtil::Len(L"abc") != 3) return 7;
+              if (!StrUtil::AsciiEqualsI(L"ImmersiveColorSet", L"immersivecolorset")) return 26;
+              if (!StrUtil::AsciiEqualsI(L"\\\\.\\DISPLAY1", L"\\\\.\\display1")) return 27;
+              if (StrUtil::AsciiEqualsI(L"DISPLAY1", L"DISPLAY10")) return 28;
+              if (StrUtil::AsciiEqualsI(nullptr, L"a") || !StrUtil::AsciiEqualsI(nullptr, nullptr)) return 29;
+              if (StrUtil::AsciiCmpI(L"DISPLAY1", L"display2") >= 0) return 30;
+              if (StrUtil::AsciiCmpI(L"DISPLAY2", L"display1") <= 0) return 31;
+              uint8_t z[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+              StrUtil::Zero(z, sizeof(z));
+              for (size_t i = 0; i < sizeof(z); ++i) {
+                  if (z[i] != 0) return 8;
+              }
+              if (wcscmp(NvApi::GetScalingLabel(NvScaling::Default), L"Default") != 0) return 9;
+              if (wcscmp(NvApi::GetScalingLabel(NvScaling::Customized), L"Custom") != 0) return 10;
+              if (wcscmp(NvApi::GetScalingLabel(static_cast<NvScaling>(99)), L"Default") != 0) return 11;
+
+              if (wcscmp(NvApi::ShortDisplayName(L"\\\\.\\DISPLAY1"), L"DISPLAY1") != 0) return 12;
+              if (wcscmp(NvApi::ShortDisplayName(L"DISPLAY2"), L"DISPLAY2") != 0) return 13;
+
+              NvDisplayInfo disps[6] = {};
+              StrUtil::SafeCopy(disps[0].displayName, 32, L"\\\\.\\DISPLAY4");
+              disps[0].foundInConfig = false;
+
+              StrUtil::SafeCopy(disps[1].displayName, 32, L"\\\\.\\DISPLAY2");
+              disps[1].foundInConfig = true; disps[1].posX = 1920; disps[1].posY = 0; disps[1].width = 1920; disps[1].height = 1080;
+
+              StrUtil::SafeCopy(disps[2].displayName, 32, L"\\\\.\\DISPLAY3");
+              disps[2].foundInConfig = true; disps[2].posX = -1920; disps[2].posY = 0; disps[2].width = 1920; disps[2].height = 1080;
+
+              StrUtil::SafeCopy(disps[3].displayName, 32, L"\\\\.\\DISPLAY5");
+              disps[3].foundInConfig = true; disps[3].posX = 0; disps[3].posY = -1080; disps[3].width = 1920; disps[3].height = 1080;
+
+              StrUtil::SafeCopy(disps[4].displayName, 32, L"\\\\.\\DISPLAY6");
+              disps[4].foundInConfig = true; disps[4].posX = 0; disps[4].posY = 1080; disps[4].width = 1920; disps[4].height = 1080;
+
+              StrUtil::SafeCopy(disps[5].displayName, 32, L"\\\\.\\DISPLAY1");
+              disps[5].foundInConfig = true; disps[5].isPrimary = true; disps[5].posX = 0; disps[5].posY = 0; disps[5].width = 1920; disps[5].height = 1080;
+
+              NvApi::SortDisplays(disps, 6);
+              if (wcscmp(disps[0].displayName, L"\\\\.\\DISPLAY1") != 0) return 14;
+              if (wcscmp(disps[1].displayName, L"\\\\.\\DISPLAY3") != 0) return 15;
+              if (wcscmp(disps[2].displayName, L"\\\\.\\DISPLAY5") != 0) return 16;
+              if (wcscmp(disps[3].displayName, L"\\\\.\\DISPLAY6") != 0) return 17;
+              if (wcscmp(disps[4].displayName, L"\\\\.\\DISPLAY2") != 0) return 18;
+              if (wcscmp(disps[5].displayName, L"\\\\.\\DISPLAY4") != 0) return 19;
+
+              if (wcscmp(NvApi::GetSpatialHint(disps, 6, 0), L"Primary") != 0) return 20;
+              if (wcscmp(NvApi::GetSpatialHint(disps, 6, 1), L"Left") != 0) return 21;
+              if (wcscmp(NvApi::GetSpatialHint(disps, 6, 2), L"Above") != 0) return 22;
+              if (wcscmp(NvApi::GetSpatialHint(disps, 6, 3), L"Below") != 0) return 23;
+              if (wcscmp(NvApi::GetSpatialHint(disps, 6, 4), L"Right") != 0) return 24;
+              if (NvApi::GetSpatialHint(disps, 6, 5) != nullptr) return 25;
+
+              wprintf(L"All StrUtil and NVAPI ABI assertions passed.\n");
+              return 0;
+          }
+          '@ | Set-Content -LiteralPath $testCpp -Encoding UTF8
+
+          try {
+              & g++.exe -std=c++20 -Wall -Wextra -Werror -municode -I "$repoSrc" "$testCpp" -o "$testExe" -luser32
+              if ($LASTEXITCODE -ne 0) { throw "Unit test compilation failed with exit code $LASTEXITCODE" }
+              & "$testExe"
+              if ($LASTEXITCODE -ne 0) { throw "Unit test failed with exit code $LASTEXITCODE" }
+          }
+          finally {
+              Remove-Item -LiteralPath $testCpp, $testExe -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Verify strict OS-only DLL imports
+        run: |
+          $ErrorActionPreference = "Stop"
+          $allowed = "KERNEL32.dll", "USER32.dll"
+
+          $dlls = & objdump.exe -p ScalingSwitcher.exe |
+              Select-String -Pattern "DLL Name:\s+(\S+)" |
+              ForEach-Object { $_.Matches[0].Groups[1].Value }
+          if ($LASTEXITCODE -ne 0) { throw "objdump failed with exit code $LASTEXITCODE" }
+          if (-not $dlls) { throw "No DLL imports found in ScalingSwitcher.exe." }
+
+          foreach ($dll in $dlls) {
+              Write-Host "Imported: $dll"
+              if ($allowed -notcontains $dll) { throw "Unexpected DLL import detected: $dll" }
+          }
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ScalingSwitcher-win64
+          path: ScalingSwitcher.exe
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ScalingSwitcher-win64
+
+      - name: Publish or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag  = $env:GITHUB_REF_NAME
+          $repo = $env:GITHUB_REPOSITORY
+          $ErrorActionPreference = "Continue"
+          gh release view $tag --repo $repo *> $null
+          $exists = ($LASTEXITCODE -eq 0)
+          $ErrorActionPreference = "Stop"
+
+          if ($exists) {
+            gh release upload $tag ScalingSwitcher.exe --repo $repo --clobber
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed with exit code $LASTEXITCODE" }
+          } else {
+            $notes = @(
+              'Lightweight portable Win32 GUI for switching NVIDIA display scaling modes (Display and GPU scaling) directly via `nvapi64.dll`.'
+              ''
+              '### Requirements'
+              '- 64-bit Windows 10 or Windows 11'
+              '- NVIDIA GPU with installed display drivers (`nvapi64.dll` in `System32`)'
+              ''
+              '### Verify Download (SHA-256)'
+              '```powershell'
+              'Get-FileHash .\ScalingSwitcher.exe -Algorithm SHA256'
+              '```'
+              'Compare against the `sha256` digest displayed next to `ScalingSwitcher.exe` in the Assets list.'
+            ) -join "`n"
+            gh release create $tag ScalingSwitcher.exe --repo $repo --title "Scaling Switcher $tag" --notes $notes
+            if ($LASTEXITCODE -ne 0) { throw "gh release create failed with exit code $LASTEXITCODE" }
+          }
